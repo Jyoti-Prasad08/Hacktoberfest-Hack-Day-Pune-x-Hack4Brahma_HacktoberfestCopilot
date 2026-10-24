@@ -1,0 +1,161 @@
+"""
+Repository analysis router.
+
+Endpoint: POST /api/analyze-repo
+Analyzes a GitHub repository and returns structured information.
+"""
+
+from fastapi import APIRouter
+
+from app.models.schemas import (
+    RepoAnalyzeRequest,
+    RepoAnalyzeResponse,
+    RepoInfo,
+    FileTreeItem,
+    IssueInfo,
+)
+from app.exceptions import AppException, ResourceNotFoundError, GitHubAPIError, AIServiceError
+from app.services.github_client import github_client
+from app.services.ai_service import ai_service
+
+router = APIRouter()
+
+
+@router.post("/analyze-repo", response_model=RepoAnalyzeResponse)
+async def analyze_repo(request: RepoAnalyzeRequest):
+    """
+    Analyze a GitHub repository.
+
+    Returns repository metadata, file structure, README summary,
+    tech stack detection, and beginner-friendly issues.
+    """
+    try:
+        import asyncio
+        # Fetch repo metadata first to determine total issue/PR count for dynamic pagination
+        repo_data = await github_client.get_repo(request.repo_url)
+        total_open = repo_data.get("open_issues_count", 100)
+        # 100 items per page; fetch up to 10 pages concurrently (covering up to 1000 issues)
+        pages_to_fetch = min(10, max(1, (total_open + 99) // 100))
+
+        (
+            file_tree_data,
+            readme_raw,
+            contributing_raw,
+            beginner_issues,
+            all_issues,
+        ) = await asyncio.gather(
+            github_client.get_file_tree(request.repo_url),
+            github_client.get_readme(request.repo_url),
+            github_client.get_contributing(request.repo_url),
+            github_client.get_beginner_issues(request.repo_url),
+            github_client.get_issues(request.repo_url, max_pages=pages_to_fetch),
+        )
+
+        # Use AI to summarize and detect tech stack
+        readme_summary = ""
+        tech_stack = []
+        contributing_summary = ""
+
+        if readme_raw:
+            readme_summary = await _summarize_readme(readme_raw)
+            tech_stack = _detect_tech_stack(readme_raw, file_tree_data)
+
+        if contributing_raw:
+            contributing_summary = await _summarize_contributing(contributing_raw)
+
+        return RepoAnalyzeResponse(
+            repo=RepoInfo(**repo_data),
+            file_tree=[FileTreeItem(**item) for item in file_tree_data],
+            readme_summary=readme_summary,
+            contributing_summary=contributing_summary,
+            tech_stack=tech_stack,
+            beginner_issues=[IssueInfo(**issue) for issue in beginner_issues],
+            all_open_issues=[IssueInfo(**issue) for issue in all_issues],
+        )
+
+    except ValueError as e:
+        raise ResourceNotFoundError(str(e))
+    except AppException:
+        raise
+    except Exception as e:
+        raise AppException(
+            message=f"Failed to analyze repository: {str(e)}",
+            status_code=500,
+            error_code="REPO_ANALYZE_ERROR",
+        )
+
+
+async def _summarize_readme(readme: str) -> str:
+    """Use AI to create a concise summary of the README."""
+    truncated = readme[:4000]
+    prompt = (
+        "Summarize this README in 3-4 sentences for a beginner contributor. "
+        "Focus on: what the project does, its main technology, and how to "
+        "get started.\n\n"
+        f"{truncated}"
+    )
+    try:
+        summary = await ai_service._generate(prompt)
+        if not summary or summary.startswith("AI service temporarily unavailable") or summary.startswith("AI service unavailable"):
+            return ""
+        return summary
+    except Exception:
+        return ""
+
+
+async def _summarize_contributing(contributing: str) -> str:
+    """Use AI to summarize contributing guidelines."""
+    truncated = contributing[:3000]
+    prompt = (
+        "Summarize these contributing guidelines in 2-3 bullet points. "
+        "Focus on the most important rules a first-time contributor must know.\n\n"
+        f"{truncated}"
+    )
+    try:
+        summary = await ai_service._generate(prompt)
+        if not summary or summary.startswith("AI service temporarily unavailable") or summary.startswith("AI service unavailable"):
+            return ""
+        return summary
+    except Exception:
+        return ""
+
+
+def _detect_tech_stack(readme: str, file_tree: list[dict]) -> list[str]:
+    """Detect the tech stack from README content and file extensions."""
+    tech_indicators = {
+        ".py": "Python",
+        ".js": "JavaScript",
+        ".ts": "TypeScript",
+        ".jsx": "React",
+        ".tsx": "React + TypeScript",
+        ".vue": "Vue.js",
+        ".go": "Go",
+        ".rs": "Rust",
+        ".java": "Java",
+        ".rb": "Ruby",
+        ".php": "PHP",
+        ".swift": "Swift",
+        ".kt": "Kotlin",
+        ".cs": "C#",
+        ".cpp": "C++",
+        ".c": "C",
+        "Dockerfile": "Docker",
+        "docker-compose": "Docker Compose",
+        ".github/workflows": "GitHub Actions",
+        "package.json": "Node.js",
+        "requirements.txt": "Python (pip)",
+        "Cargo.toml": "Rust (Cargo)",
+        "go.mod": "Go Modules",
+        "Gemfile": "Ruby (Bundler)",
+        "pom.xml": "Java (Maven)",
+        "build.gradle": "Java (Gradle)",
+    }
+
+    detected = set()
+    for item in file_tree:
+        path = item["path"].lower()
+        for indicator, tech in tech_indicators.items():
+            if path.endswith(indicator.lower()) or indicator.lower() in path:
+                detected.add(tech)
+
+    return sorted(list(detected))

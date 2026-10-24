@@ -1,0 +1,471 @@
+'use client';
+
+import { Suspense, useEffect, useState, useMemo } from 'react';
+import { useSearchParams, useRouter } from 'next/navigation';
+import Link from 'next/link';
+import Breadcrumbs from '../../components/Breadcrumbs';
+
+function AnalyzeContent() {
+  const searchParams = useSearchParams();
+  const repoUrl = searchParams.get('url');
+  const router = useRouter();
+
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  // Search & Filter state (Issue #29)
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedDifficulty, setSelectedDifficulty] = useState('ALL');
+  const [inputUrl, setInputUrl] = useState('');
+
+  useEffect(() => {
+    if (!repoUrl) {
+      setLoading(false);
+      return;
+    }
+
+    const cacheKey = `hf_analysis_v4_${encodeURIComponent(repoUrl)}`;
+
+    // Try reading from sessionStorage for instant page back/forward navigation
+    try {
+      const cached = sessionStorage.getItem(cacheKey);
+      if (cached) {
+        setData(JSON.parse(cached));
+        setLoading(false);
+        return;
+      }
+    } catch {
+      // Ignore storage error
+    }
+
+    const fetchRepoData = async () => {
+      try {
+        let apiBase = (process.env.NEXT_PUBLIC_API_URL || '').replace(/\/$/, '');
+        if (!apiBase || (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && apiBase.includes('localhost'))) {
+          apiBase = 'https://hacktoberfest-copilot-backend-production-fe4a.up.railway.app';
+        }
+        const response = await fetch(`${apiBase}/api/analyze-repo`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ repo_url: repoUrl }),
+        });
+
+        if (!response.ok) {
+          throw new Error('Failed to analyze repository. Make sure the backend is running.');
+        }
+
+        const result = await response.json();
+        setData(result);
+
+        // Store in sessionStorage and save to recent searches
+        try {
+          sessionStorage.setItem(cacheKey, JSON.stringify(result));
+          const stored = JSON.parse(localStorage.getItem('hf_recent_repos') || '[]');
+          const filtered = Array.isArray(stored) ? stored.filter((item) => item !== repoUrl) : [];
+          localStorage.setItem('hf_recent_repos', JSON.stringify([repoUrl, ...filtered].slice(0, 5)));
+        } catch {
+          // Ignore storage quota errors
+        }
+      } catch (err) {
+        setError(err.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchRepoData();
+  }, [repoUrl, router]);
+
+  const allIssues = useMemo(() => {
+    if (!data) return [];
+    
+    const combined = [...(data.all_open_issues || []), ...(data.beginner_issues || [])];
+    const uniqueMap = new Map();
+    combined.forEach((issue) => {
+      uniqueMap.set(issue.number, issue);
+    });
+    const uniqueIssues = Array.from(uniqueMap.values());
+
+    return uniqueIssues.map((issue) => {
+      const labelNames = (issue.labels || []).map((l) => (typeof l === 'string' ? l.toLowerCase() : ''));
+      const text = `${issue.title || ''} ${issue.body || ''}`.toLowerCase();
+
+      // 1. Explicit Labels
+      if (labelNames.some((l) => l.includes('hard') || l.includes('advanced') || l.includes('expert') || l.includes('level3'))) {
+        return { ...issue, difficulty: 'ADVANCED' };
+      }
+      if (labelNames.some((l) => l.includes('good first') || l.includes('beginner') || l.includes('easy') || l.includes('starter') || l.includes('first-timers-only') || l.includes('level1') || l.includes('doc'))) {
+        return { ...issue, difficulty: 'BEGINNER' };
+      }
+      if (labelNames.some((l) => l.includes('medium') || l.includes('intermediate') || l.includes('help wanted') || l.includes('level2'))) {
+        return { ...issue, difficulty: 'INTERMEDIATE' };
+      }
+
+      // 2. Advanced Keywords in title/body (security, auth, rate-limit, CI/CD, database)
+      const advKeywords = [
+        'security', 'vulnerability', 'rate limit', 'brute', 'auth', 'jwt',
+        'ci', 'github actions', 'pipeline', 'docker', 'concurrency', 'database',
+        'migration', 'performance', 'payment', 'encrypt', 'leak', 'injection', 'cors'
+      ];
+      if (advKeywords.some((k) => new RegExp(`\\b${k}\\b`, 'i').test(text))) {
+        return { ...issue, difficulty: 'ADVANCED' };
+      }
+
+      // 3. Beginner Keywords in title/body (docs, text, css, styling, typos, assets)
+      const begKeywords = [
+        'typo', 'doc', 'docs', 'readme', 'spelling', 'link', 'links', 'footer',
+        'color', 'contrast', 'icon', 'logo', 'image', 'images', 'pics', 'grammar',
+        'css', 'style', 'text', 'asset', 'comment', 'broken ui', 'overflow', 'responsive'
+      ];
+      if (begKeywords.some((k) => new RegExp(`\\b${k}\\b`, 'i').test(text))) {
+        return { ...issue, difficulty: 'BEGINNER' };
+      }
+
+      // Default for standard feature requests & enhancements
+      return {
+        ...issue,
+        difficulty: 'INTERMEDIATE',
+      };
+    });
+  }, [data]);
+
+  // Compute counts per category
+  const difficultyCounts = useMemo(() => {
+    const counts = {
+      ALL: allIssues.length,
+      BEGINNER: 0,
+      INTERMEDIATE: 0,
+      ADVANCED: 0,
+    };
+    allIssues.forEach((issue) => {
+      if (counts[issue.difficulty] !== undefined) {
+        counts[issue.difficulty] += 1;
+      } else {
+        counts.BEGINNER += 1;
+      }
+    });
+    return counts;
+  }, [allIssues]);
+
+  // Filtered issues based on query & difficulty
+  const filteredIssues = useMemo(() => {
+    return allIssues.filter((issue) => {
+      const matchesDifficulty = selectedDifficulty === 'ALL' || issue.difficulty === selectedDifficulty;
+      if (!matchesDifficulty) return false;
+
+      if (!searchQuery.trim()) return true;
+
+      const q = searchQuery.toLowerCase();
+      const titleMatch = issue.title?.toLowerCase().includes(q);
+      const bodyMatch = issue.body?.toLowerCase().includes(q);
+      const labelMatch = (issue.labels || []).some((l) => 
+        (typeof l === 'string' ? l.toLowerCase() : '').includes(q)
+      );
+      const numberMatch = String(issue.number).includes(q);
+
+      return titleMatch || bodyMatch || labelMatch || numberMatch;
+    });
+  }, [allIssues, searchQuery, selectedDifficulty]);
+
+  const handleSearchSubmit = (e) => {
+    e.preventDefault();
+    if (inputUrl.trim()) {
+      router.push(`/analyze?url=${encodeURIComponent(inputUrl.trim())}`);
+    }
+  };
+
+  if (!repoUrl) {
+    return (
+      <div className="container dashboard animate-fade-in" style={{ padding: '24px 28px' }}>
+        <Breadcrumbs items={[{ label: 'Repository Analyzer', href: null }]} />
+        
+        <div className="nb-card nb-analyzer-main" style={{ marginTop: '20px' }}>
+          <div className="nb-analyzer-main__header">
+            <span className="nb-tag-tech">AI REPOSITORY ENGINE</span>
+            <span className="nb-label-tracked">FEATURE 02: REPOSITORY ANALYZER</span>
+          </div>
+
+          <h1 className="nb-hero-headline" style={{ fontSize: '2.4rem', margin: '16px 0 10px' }}>
+            Repository Analyzer
+          </h1>
+          <p className="nb-hero-subtext" style={{ maxWidth: '680px', marginBottom: '24px' }}>
+            Scan any public GitHub repository to uncover beginner-friendly issues, tech stacks, and AI-generated step-by-step implementation roadmaps with Google Gemma 4.
+          </p>
+
+          <form className="nb-search-form" onSubmit={handleSearchSubmit}>
+            <div className="nb-search-input-box">
+              <span className="nb-search-icon" aria-hidden="true">🔍</span>
+              <input
+                type="text"
+                className="nb-search-input"
+                placeholder="https://github.com/adithyan-css/Brownie-Bliss or org/repo"
+                value={inputUrl}
+                onChange={(e) => setInputUrl(e.target.value)}
+                required
+                id="analyzer-input-repo"
+              />
+              <button
+                type="submit"
+                className="nb-search-submit-btn"
+                disabled={!inputUrl.trim()}
+              >
+                Scan Repository →
+              </button>
+            </div>
+          </form>
+
+          {/* Quick Preset Repos */}
+          <div style={{ marginTop: '32px' }}>
+            <h4 style={{ fontFamily: 'var(--font-display)', fontSize: '1.05rem', fontWeight: 800, marginBottom: '14px' }}>
+              ⚡ Featured Hacktoberfest Repositories:
+            </h4>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '16px' }}>
+              {[
+                { name: 'adithyan-css/Brownie-Bliss', tag: '569 Issues • Bakery Web App (CSS/JS)', url: 'https://github.com/adithyan-css/Brownie-Bliss', icon: '🧁' },
+                { name: 'fastapi/fastapi', tag: 'High-perf Python Web Framework', url: 'https://github.com/fastapi/fastapi', icon: '⚡' },
+                { name: 'facebook/react', tag: 'The library for web and native user interfaces', url: 'https://github.com/facebook/react', icon: '⚛️' },
+                { name: 'vercel/next.js', tag: 'The React Framework for the Web', url: 'https://github.com/vercel/next.js', icon: '▲' },
+              ].map((p) => (
+                <button
+                  key={p.url}
+                  type="button"
+                  onClick={() => router.push(`/analyze?url=${encodeURIComponent(p.url)}`)}
+                  className="nb-card"
+                  style={{ 
+                    textAlign: 'left', 
+                    cursor: 'pointer', 
+                    padding: '16px',
+                    background: 'var(--nb-card-bg)',
+                    border: 'var(--nb-border)',
+                    boxShadow: 'var(--nb-shadow-sm)',
+                    transition: 'all var(--transition-fast)'
+                  }}
+                >
+                  <div style={{ fontSize: '1.6rem', marginBottom: '8px' }}>{p.icon}</div>
+                  <strong style={{ display: 'block', fontSize: '0.96rem', fontFamily: 'var(--font-display)' }}>{p.name}</strong>
+                  <span style={{ fontSize: '0.8rem', color: 'var(--nb-text-muted)', display: 'block', marginTop: '4px' }}>{p.tag}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="container dashboard">
+        <div className="loading animate-fade-in">
+          <div className="loading__spinner" />
+          <h2 className="loading__text">Analyzing {repoUrl}...</h2>
+          <p className="footer__text">
+            This might take a moment. Gemma 4 is reading the README and mapping the file tree.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="container dashboard">
+        <div className="error animate-fade-in">
+          <div className="error__icon">⚠️</div>
+          <h2 className="error__title">Analysis Failed</h2>
+          <p className="error__message">{error}</p>
+          <button className="error__retry" onClick={() => window.location.reload()}>
+            Try Again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!data) return null;
+
+  return (
+    <div className="container dashboard animate-fade-in">
+      <div className="nb-top-nav-row">
+        <Breadcrumbs items={[{ label: data.repo?.full_name || 'Repository Analyzer', href: null }]} />
+        <Link href="/" className="dashboard__back">
+          ← Back to Search
+        </Link>
+      </div>
+
+      {/* Repo Summary Card */}
+      <div className="repo-card">
+        <div className="repo-card__header">
+          <h1 className="repo-card__name">{data.repo.full_name}</h1>
+          <div className="repo-card__stats">
+            <span className="repo-card__stat">⭐ {data.repo.stars?.toLocaleString() || 0} stars</span>
+            <span className="repo-card__stat">🍴 {data.repo.forks?.toLocaleString() || 0} forks</span>
+            <span className="repo-card__stat">🟢 {difficultyCounts.ALL?.toLocaleString() || 0} open issues</span>
+            {data.repo.open_issues_count > difficultyCounts.ALL && (
+              <span className="repo-card__stat">🔀 {(data.repo.open_issues_count - difficultyCounts.ALL)?.toLocaleString()} open PRs</span>
+            )}
+          </div>
+        </div>
+
+        <p className="repo-card__desc">
+          {(!data.readme_summary || data.readme_summary.startsWith('AI service'))
+            ? (data.repo.description || data.readme_summary || 'No description available.')
+            : data.readme_summary}
+        </p>
+
+        <div className="repo-card__tags">
+          {data.repo.language && (
+            <span className="tag tag--tech">{data.repo.language}</span>
+          )}
+          {data.tech_stack?.map((tech) => (
+            <span key={tech} className="tag tag--tech">
+              {tech}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      {/* Interactive Search & Difficulty Filters Section */}
+      <div className="filter-panel">
+        <div className="filter-search-box">
+          <span className="filter-search-icon">🔍</span>
+          <input
+            type="text"
+            className="filter-search-input"
+            placeholder="Search issues by title, body, label, or #number..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            id="issue-search-input"
+          />
+          {searchQuery && (
+            <button
+              className="filter-search-clear"
+              onClick={() => setSearchQuery('')}
+              aria-label="Clear search"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+
+        <div className="filter-pills-row">
+          <button
+            className={`filter-pill ${selectedDifficulty === 'ALL' ? 'filter-pill--active' : ''}`}
+            onClick={() => setSelectedDifficulty('ALL')}
+          >
+            All Issues <span className="filter-pill__count">{difficultyCounts.ALL}</span>
+          </button>
+          <button
+            className={`filter-pill filter-pill--beginner ${selectedDifficulty === 'BEGINNER' ? 'filter-pill--active' : ''}`}
+            onClick={() => setSelectedDifficulty('BEGINNER')}
+          >
+            🌱 Beginner (Good First Issue) <span className="filter-pill__count">{difficultyCounts.BEGINNER}</span>
+          </button>
+          <button
+            className={`filter-pill filter-pill--intermediate ${selectedDifficulty === 'INTERMEDIATE' ? 'filter-pill--active' : ''}`}
+            onClick={() => setSelectedDifficulty('INTERMEDIATE')}
+          >
+            ⚡ Intermediate <span className="filter-pill__count">{difficultyCounts.INTERMEDIATE}</span>
+          </button>
+          <button
+            className={`filter-pill filter-pill--advanced ${selectedDifficulty === 'ADVANCED' ? 'filter-pill--active' : ''}`}
+            onClick={() => setSelectedDifficulty('ADVANCED')}
+          >
+            🔥 Advanced <span className="filter-pill__count">{difficultyCounts.ADVANCED}</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Issues List Section */}
+      <div className="issues-section">
+        <div className="issues-section__header-row">
+          <h2 className="issues-section__title">
+            🎯 Filtered Contribution Opportunities
+            <span className="tag tag--beginner">
+              {filteredIssues.length} Shown
+            </span>
+          </h2>
+          {(searchQuery || selectedDifficulty !== 'ALL') && (
+            <button
+              className="filter-reset-btn"
+              onClick={() => {
+                setSearchQuery('');
+                setSelectedDifficulty('ALL');
+              }}
+            >
+              Reset Filters
+            </button>
+          )}
+        </div>
+        
+        {filteredIssues.length === 0 ? (
+          <div className="empty-filter-card animate-fade-in">
+            <span className="empty-filter-icon">🔍</span>
+            <h3>No matching issues found</h3>
+            <p>
+              We couldn&apos;t find any issues matching &ldquo;<strong>{searchQuery}</strong>&rdquo; under the{' '}
+              <strong>{selectedDifficulty.toLowerCase()}</strong> difficulty filter.
+            </p>
+            <button
+              className="empty-filter-btn"
+              onClick={() => {
+                setSearchQuery('');
+                setSelectedDifficulty('ALL');
+              }}
+            >
+              Clear All Filters
+            </button>
+          </div>
+        ) : (
+          <div className="issue-list stagger-children">
+            {filteredIssues.map((issue) => (
+              <Link 
+                href={`/issue/${issue.number}?url=${encodeURIComponent(repoUrl)}`} 
+                key={issue.number}
+                className="issue-card animate-fade-in-up"
+              >
+                <div className="issue-card__header">
+                  <h3 className="issue-card__title">{issue.title}</h3>
+                  <div className="issue-card__badge-group">
+                    <span className={`tag tag--${issue.difficulty.toLowerCase()}`}>
+                      {issue.difficulty}
+                    </span>
+                    <span className="issue-card__number">#{issue.number}</span>
+                  </div>
+                </div>
+                <div className="issue-card__body">
+                  {issue.body || 'No description provided.'}
+                </div>
+                <div className="issue-card__footer">
+                  {issue.labels?.map((label) => (
+                    <span key={typeof label === 'string' ? label : label.name} className="tag tag--label">
+                      {typeof label === 'string' ? label : label.name}
+                    </span>
+                  ))}
+                </div>
+              </Link>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function AnalyzePage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="container dashboard">
+          <div className="loading animate-fade-in">
+            <div className="loading__spinner" />
+            <h2 className="loading__text">Loading analysis...</h2>
+          </div>
+        </div>
+      }
+    >
+      <AnalyzeContent />
+    </Suspense>
+  );
+}
